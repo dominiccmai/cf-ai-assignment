@@ -17,6 +17,19 @@ function safeParse(msg: WSMessage): { text: string } {
   }
 }
 
+type Turn = { role: "user" | "assistant"; content: string };
+type Msg = { role: "system" | "user" | "assistant"; content: string };
+
+async function getRecentTurns(agent: AppAgent, limit = 12): Promise<Turn[]> {
+  // newest first
+  const rows = await agent.sql`
+    SELECT role, content FROM chat_log
+    ORDER BY id DESC LIMIT ${limit}
+  `;
+  // convert to oldest-first for the LLM
+  return rows.reverse().map((r: any) => ({ role: r.role, content: r.content }));
+}
+
 // ---- Extract text from different AI response shapes
 function extractText(resp: any): string {
   if (!resp) return "⚠️ empty response from model";
@@ -51,65 +64,57 @@ export class AppAgent extends Agent<Env> {
   }
 
   async onMessage(conn: Connection, message: WSMessage) {
-    const { text } = safeParse(message);
+  const { text } = safeParse(message);
 
+  try {
+    await this.ensureSchema();
+    await this.sql`INSERT INTO chat_log (role, content) VALUES ('user', ${text})`;
+
+    // --- Vectorize memory (non-fatal)
+    let memory = "";
     try {
-      // 0) Make sure DB exists
-      await this.ensureSchema();
+      const emb: any = await this.env.AI.run("@cf/baai/bge-large-en-v1.5", { text });
+      const vector: number[] = emb.data[0].embedding;
+      const result = await this.env.VECTORS.query(vector, { topK: 4, returnMetadata: true });
+      memory = (result.matches ?? [])
+        .map((m: any) => m.metadata?.text)
+        .filter(Boolean)
+        .join("\n---\n");
+    } catch { /* ignore */ }
 
-      // 1) Save user message
-      await this.sql`INSERT INTO chat_log (role, content) VALUES ('user', ${text})`;
+    // --- Pull recent turns so the model has continuity
+    const turns = await getRecentTurns(this, 12); // ~6 last exchanges
 
-      // 2) Try to build memory context (but don't fail the chat if it breaks)
-      let memory = "";
-      try {
-        const emb: any = await this.env.AI.run("@cf/baai/bge-large-en-v1.5", { text });
-        const vector: number[] = emb.data[0].embedding;
+    // --- System + (optional) memory primer
+    const system = `You are a helpful Cloudflare app assistant.
+Keep answers concise. If relevant memory is provided, use it briefly.`;
 
-        const result = await this.env.VECTORS.query(vector, {
-          topK: 4,
-          returnMetadata: true,
-        });
+    // Convert our stored turns to model messages
+    const historyMsgs: Msg[] = turns.map(t => ({ role: t.role, content: t.content }));
 
-        memory = (result.matches ?? [])
-          .map((m: any) => m.metadata?.text)
-          .filter(Boolean)
-          .join("\n---\n");
-      } catch {
-        // Vectorize or embeddings unavailable — continue without memory
-        memory = "";
-      }
+    // Append a short “memory” note only if we have it
+    const memoryMsg: Msg[] = memory
+    ? [{ role: "system", content: `Relevant memory:\n${memory}` }]
+    : [];
 
-      // 3) Ask Llama 3.3 (works with/without memory)
-      const system =
-        "You are a helpful Cloudflare app assistant. If memory is provided, ground your answer in it briefly.";
-      const raw = (await this.env.AI.run("@cf/meta/llama-3.3-70b-instruct-fp8-fast", {
-        messages: [
-          { role: "system", content: system },
-          {
-            role: "user",
-            content:
-              memory
-                ? `User: ${text}\n\nRelevant memory:\n${memory}`
-                : `User: ${text}`,
-          },
-        ],
-      })) as any;
+    const messages: Msg[] = [
+        { role: "system", content: system },
+        ...historyMsgs,
+        ...memoryMsg,
+    ];
 
-      const reply = extractText(raw);
+    const raw = await this.env.AI.run("@cf/meta/llama-3.3-70b-instruct-fp8-fast", { messages }) as any;
+    const reply = extractText(raw);
 
-      // 4) Save + send reply
-      await this.sql`INSERT INTO chat_log (role, content) VALUES ('assistant', ${reply})`;
-      this.setState({ lastReply: reply });
-      conn.send(JSON.stringify({ type: "chat", text: reply }));
-    } catch (err: any) {
-      // Always send *something* so the UI never stalls
-      const msg =
-        "Sorry — I hit an error and couldn’t answer. Try again in a moment.";
-      this.setState({ lastReply: msg });
-      conn.send(JSON.stringify({ text: msg }));
-    }
+    await this.sql`INSERT INTO chat_log (role, content) VALUES ('assistant', ${reply})`;
+    this.setState({ lastReply: reply });     // state-sync (client ignores it)
+    conn.send(JSON.stringify({ type: "chat", text: reply })); // explicit chat frame
+  } catch (err) {
+    const msg = "Sorry — I hit an error and couldn’t answer. Try again.";
+    this.setState({ lastReply: msg });
+    conn.send(JSON.stringify({ type: "chat", text: msg }));
   }
+}
 
   // Optional helper you can hit via an HTTP route if you want summaries
   async summarize(): Promise<string> {
