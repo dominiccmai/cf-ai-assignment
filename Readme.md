@@ -4,6 +4,8 @@ An AI-powered chat application built with Cloudflare’s developer platform.
 
 **Live demo:** [https://cf-ai-assignment.dlmai-ai.workers.dev](https://cf-ai-assignment.dlmai-ai.workers.dev)
 
+<img width="938" height="894" alt="image" src="https://github.com/user-attachments/assets/b10a8477-bc56-4b22-94ca-1518612938e4" />
+
 ---
 
 ## Features
